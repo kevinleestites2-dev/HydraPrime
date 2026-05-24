@@ -1,37 +1,35 @@
 #!/usr/bin/env python3
 """
 HydraPrime Bridge — hydra_bridge.py
-The internal message bus connecting all three heads.
-OpenClaw (hardware) ↔ Hermes (brain) ↔ OpenHuman (context)
-+ Telegram reporting
+Internal message bus: OpenClaw ↔ Hermes ↔ OpenHuman
++ Telegram heartbeat every 30 minutes
 """
 
-import os
-import json
-import asyncio
-import aiohttp
-import requests
-import threading
-import time
+import os, json, time, threading, requests
 from datetime import datetime
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 
-# ── Load config ────────────────────────────────────────────
-load_dotenv(os.path.expanduser("~/HydraPrime/config/hydra.env"))
+# ── Config ─────────────────────────────────────────────────
+_cfg = os.path.expanduser("~/HydraPrime/config/hydra.env")
+if os.path.exists(_cfg):
+    load_dotenv(_cfg)
 
-OPENCLAW_URL   = f"http://localhost:{os.getenv('OPENCLAW_PORT', '18789')}"
-HERMES_URL     = f"http://localhost:{os.getenv('HERMES_GATEWAY_PORT', '8765')}"
-OPENHUMAN_URL  = f"http://localhost:{os.getenv('OPENHUMAN_PORT', '3000')}"
-TG_TOKEN       = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TG_CHAT_ID     = os.getenv("TELEGRAM_CHAT_ID", "")
-BRIDGE_PORT    = int(os.getenv("HYDRA_BRIDGE_PORT", "9999"))
+OPENCLAW_PORT   = os.getenv("OPENCLAW_PORT",   "18789")
+HERMES_PORT     = os.getenv("HERMES_GATEWAY_PORT", "8765")
+OPENHUMAN_PORT  = os.getenv("OPENHUMAN_PORT",  "3000")
+BRIDGE_PORT     = int(os.getenv("HYDRA_BRIDGE_PORT", "9999"))
+TG_TOKEN        = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TG_CHAT_ID      = os.getenv("TELEGRAM_CHAT_ID",   "")
+
+OPENCLAW_BASE   = f"http://localhost:{OPENCLAW_PORT}"
+HERMES_BASE     = f"http://localhost:{HERMES_PORT}"
+OPENHUMAN_BASE  = f"http://localhost:{OPENHUMAN_PORT}"
 
 app = Flask(__name__)
 
-# ── Telegram reporting ─────────────────────────────────────
-def tg_send(msg: str):
-    """Send a message to Telegram."""
+# ── Telegram ───────────────────────────────────────────────
+def tg(msg: str):
     if not TG_TOKEN or not TG_CHAT_ID:
         return
     try:
@@ -43,105 +41,108 @@ def tg_send(msg: str):
     except Exception:
         pass
 
-# ── Head health check ──────────────────────────────────────
-def check_head(name: str, url: str) -> dict:
+# ── Head health ────────────────────────────────────────────
+def ping(name: str, url: str) -> dict:
     try:
         r = requests.get(url, timeout=3)
         return {"head": name, "status": "online", "code": r.status_code}
     except Exception as e:
         return {"head": name, "status": "offline", "error": str(e)}
 
-# ── Hardware query (OpenClaw) ──────────────────────────────
+# ── HEAD 1: OpenClaw hardware queries ─────────────────────
+SENSOR_MAP = {
+    "gps":        "/api/location",
+    "battery":    "/api/battery",
+    "camera":     "/api/camera/capture",
+    "network":    "/api/network",
+    "sensors":    "/api/sensors",
+    "microphone": "/api/audio/record",
+}
+
 def sense(sensor: str) -> dict:
-    """Query hardware via OpenClaw."""
-    sensor_map = {
-        "gps":         "/api/location",
-        "battery":     "/api/battery",
-        "camera":      "/api/camera/capture",
-        "network":     "/api/network",
-        "sensors":     "/api/sensors",
-        "microphone":  "/api/audio/record",
-    }
-    endpoint = sensor_map.get(sensor, f"/api/{sensor}")
+    endpoint = SENSOR_MAP.get(sensor, f"/api/{sensor}")
     try:
-        r = requests.get(f"{OPENCLAW_URL}{endpoint}", timeout=10)
+        r = requests.get(f"{OPENCLAW_BASE}{endpoint}", timeout=10)
         return {"sensor": sensor, "data": r.json()}
     except Exception as e:
         return {"sensor": sensor, "error": str(e)}
 
-# ── Send task to Hermes brain ──────────────────────────────
+# ── HEAD 2: Hermes brain ───────────────────────────────────
+# Hermes exposes an HTTP gateway via: hermes gateway --port 8765
+# The gateway accepts task payloads and returns agent results.
 def think(task: str, context: dict = None) -> dict:
-    """Send a task to the Hermes agent."""
     payload = {"task": task}
     if context:
         payload["context"] = context
     try:
-        r = requests.post(f"{HERMES_URL}/execute", json=payload, timeout=60)
+        r = requests.post(f"{HERMES_BASE}/execute", json=payload, timeout=90)
         return r.json()
     except Exception as e:
-        return {"error": str(e), "task": task}
+        # Fallback: try /run endpoint (Hermes version differences)
+        try:
+            r = requests.post(f"{HERMES_BASE}/run", json={"prompt": task}, timeout=90)
+            return r.json()
+        except Exception:
+            return {"error": str(e), "task": task}
 
-# ── Pull context from OpenHuman ────────────────────────────
+# ── HEAD 3: OpenHuman context ─────────────────────────────
+CONTEXT_MAP = {
+    "today":    "/api/context/today",
+    "calendar": "/api/integrations/calendar",
+    "email":    "/api/integrations/gmail",
+    "memory":   "/api/memory/tree",
+    "all":      "/api/context/full",
+    "slack":    "/api/integrations/slack",
+    "github":   "/api/integrations/github",
+    "notion":   "/api/integrations/notion",
+}
+
 def get_context(scope: str = "today") -> dict:
-    """Pull life context from OpenHuman."""
-    scope_map = {
-        "today":    "/api/context/today",
-        "calendar": "/api/integrations/calendar",
-        "email":    "/api/integrations/gmail",
-        "memory":   "/api/memory/tree",
-        "all":      "/api/context/full",
-    }
-    endpoint = scope_map.get(scope, f"/api/context/{scope}")
+    endpoint = CONTEXT_MAP.get(scope, f"/api/context/{scope}")
     try:
-        r = requests.get(f"{OPENHUMAN_URL}{endpoint}", timeout=10)
+        r = requests.get(f"{OPENHUMAN_BASE}{endpoint}", timeout=10)
         return {"scope": scope, "data": r.json()}
     except Exception as e:
         return {"scope": scope, "error": str(e)}
 
-# ── Full fusion: sense + context → think ──────────────────
-def fuse_and_execute(task: str) -> dict:
+# ── Full fusion loop ───────────────────────────────────────
+def fuse(task: str) -> dict:
     """
-    The full HydraPrime loop:
-    1. Pull hardware context (OpenClaw)
+    The HydraPrime execution loop:
+    1. Snapshot hardware state (OpenClaw)
     2. Pull life context (OpenHuman)
-    3. Inject both into Hermes brain
-    4. Execute and report to Telegram
+    3. Inject both into Hermes + execute
+    4. Report to Telegram
     """
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{timestamp}] 🐉 HydraPrime executing: {task}")
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{ts}] 🐉 Executing: {task}")
 
-    # Head 1: Hardware snapshot
     hardware = {
         "gps":     sense("gps"),
         "battery": sense("battery"),
         "network": sense("network"),
     }
-
-    # Head 3: Life context
     life = get_context("today")
-
-    # Head 2: Execute with full context
     result = think(task, context={"hardware": hardware, "life_context": life})
 
-    # Report to Telegram
-    output = result.get("result", result.get("output", str(result)))
-    tg_send(f"Task: {task}\n\nResult: {output[:1000]}")
+    output = result.get("result", result.get("output", result.get("response", str(result))))
+    tg(f"Task: {task}\n\nResult: {str(output)[:1000]}")
 
     return {
         "task": task,
         "result": result,
-        "hardware_snapshot": hardware,
+        "hardware": hardware,
         "life_context": life,
-        "timestamp": timestamp,
+        "timestamp": ts,
     }
 
-# ── Flask API endpoints ────────────────────────────────────
-@app.route("/status", methods=["GET"])
+# ── Flask routes ───────────────────────────────────────────
+@app.route("/status")
 def status():
     heads = [
-        check_head("OpenClaw",  OPENCLAW_URL),
-        check_head("Hermes",    HERMES_URL),
-        check_head("OpenHuman", OPENHUMAN_URL),
+        ping("OpenClaw",  OPENCLAW_BASE),
+        ping("Hermes",    HERMES_BASE),
+        ping("OpenHuman", OPENHUMAN_BASE),
     ]
     online = sum(1 for h in heads if h["status"] == "online")
     return jsonify({
@@ -157,58 +158,68 @@ def route_think():
     task = data.get("task", "")
     if not task:
         return jsonify({"error": "task required"}), 400
-    result = think(task, data.get("context"))
-    return jsonify(result)
+    return jsonify(think(task, data.get("context")))
 
-@app.route("/sense/<sensor>", methods=["GET"])
+@app.route("/sense/<sensor>")
 def route_sense(sensor):
     return jsonify(sense(sensor))
 
-@app.route("/context/<scope>", methods=["GET"])
+@app.route("/context/<scope>")
 def route_context(scope):
     return jsonify(get_context(scope))
 
 @app.route("/execute", methods=["POST"])
 def route_execute():
-    """Full fusion execution — all three heads."""
     data = request.json or {}
     task = data.get("task", "")
     if not task:
         return jsonify({"error": "task required"}), 400
-    return jsonify(fuse_and_execute(task))
+    return jsonify(fuse(task))
 
 @app.route("/report", methods=["POST"])
 def route_report():
-    """Send a message to Telegram."""
     data = request.json or {}
-    msg = data.get("message", "")
-    tg_send(msg)
+    tg(data.get("message", ""))
     return jsonify({"sent": True})
 
+@app.route("/mcp/tools", methods=["GET"])
+def mcp_tools():
+    """Proxy MCP tool listing from OpenHuman's MCP server."""
+    try:
+        r = requests.get(f"{OPENHUMAN_BASE}/mcp/tools", timeout=5)
+        return jsonify(r.json())
+    except Exception as e:
+        return jsonify({"error": str(e)}), 503
+
+@app.route("/mcp/execute", methods=["POST"])
+def mcp_execute():
+    """Proxy MCP tool execution to OpenHuman."""
+    data = request.json or {}
+    try:
+        r = requests.post(f"{OPENHUMAN_BASE}/mcp/execute", json=data, timeout=30)
+        return jsonify(r.json())
+    except Exception as e:
+        return jsonify({"error": str(e)}), 503
+
 # ── Heartbeat ──────────────────────────────────────────────
-def heartbeat_loop():
-    """Send a heartbeat to Telegram every 30 minutes."""
+def heartbeat():
     while True:
-        time.sleep(1800)
+        time.sleep(1800)  # 30 minutes
         heads = [
-            check_head("OpenClaw",  OPENCLAW_URL),
-            check_head("Hermes",    HERMES_URL),
-            check_head("OpenHuman", OPENHUMAN_URL),
+            ping("OpenClaw",  OPENCLAW_BASE),
+            ping("Hermes",    HERMES_BASE),
+            ping("OpenHuman", OPENHUMAN_BASE),
         ]
-        online = [h["head"] for h in heads if h["status"] == "online"]
-        offline = [h["head"] for h in heads if h["status"] == "offline"]
-        msg = f"💓 Heartbeat\nOnline: {', '.join(online) if online else 'none'}"
-        if offline:
-            msg += f"\n⚠️ Offline: {', '.join(offline)}"
-        tg_send(msg)
+        on  = [h["head"] for h in heads if h["status"] == "online"]
+        off = [h["head"] for h in heads if h["status"] == "offline"]
+        msg = f"💓 Heartbeat [{datetime.now().strftime('%H:%M')}]\n"
+        msg += f"Online: {', '.join(on) if on else 'none'}"
+        if off:
+            msg += f"\n⚠️ Offline: {', '.join(off)}"
+        tg(msg)
 
 if __name__ == "__main__":
-    # Announce startup
-    tg_send("🐉 HydraPrime Bridge ONLINE\nAll three heads initializing...")
-
-    # Start heartbeat in background
-    hb = threading.Thread(target=heartbeat_loop, daemon=True)
-    hb.start()
-
-    print(f"🐉 HydraPrime Bridge running on port {BRIDGE_PORT}")
+    tg("🐉 HydraPrime Bridge ONLINE — all three heads initializing")
+    threading.Thread(target=heartbeat, daemon=True).start()
+    print(f"🐉 HydraPrime Bridge → port {BRIDGE_PORT}")
     app.run(host="0.0.0.0", port=BRIDGE_PORT, debug=False)
