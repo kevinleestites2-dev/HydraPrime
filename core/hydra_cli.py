@@ -1,153 +1,193 @@
 #!/usr/bin/env python3
 """
 HydraPrime CLI — hydra
-Usage: hydra <command> [args]
+Single entry point for all three heads.
 """
 
-import sys
-import requests
-import subprocess
-import os
-import json
+import sys, os, json, subprocess, requests, time
 
 BRIDGE = "http://localhost:9999"
-
-def banner():
-    print("🐉 HydraPrime — Three heads. One body.")
+HYDRA_DIR = os.path.expanduser("~/HydraPrime")
 
 def cmd_start():
-    """Start all three heads + the bridge."""
-    print("🐉 Starting HydraPrime...")
+    print("🐉 Starting HydraPrime...\n")
 
-    # Start OpenClaw
-    subprocess.Popen(["sv", "up", "openclaw"],
-                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    print("  🦾 OpenClaw → starting")
+    # ── Head 1: OpenClaw ──
+    try:
+        subprocess.Popen(
+            ["sv", "up", "openclaw"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        subprocess.Popen(["termux-wake-lock"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        print("  🦾 OpenClaw     → starting (sv up openclaw)")
+    except Exception as e:
+        print(f"  🦾 OpenClaw     → warning: {e}")
 
-    # Start Hermes in proot
-    subprocess.Popen(
-        ["proot-distro", "login", "ubuntu", "--", "bash", "-c",
-         "cd /root/hermes && hermes gateway --port 8765 &> /tmp/hermes.log &"],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    # ── Head 2: Hermes (runs inside proot Ubuntu) ──
+    hermes_cmd = (
+        "proot-distro login ubuntu -- bash -c "
+        "'cd /root/hermes-agent && source venv/bin/activate && "
+        "hermes gateway --port 8765 >> /tmp/hermes_gateway.log 2>&1 &'"
     )
-    print("  🧠 Hermes → starting")
+    try:
+        subprocess.Popen(hermes_cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        print("  🧠 Hermes       → starting (hermes gateway --port 8765)")
+    except Exception as e:
+        print(f"  🧠 Hermes       → warning: {e}")
 
-    # Start OpenHuman
-    oh_dir = os.path.expanduser("~/HydraPrime/heads/openhuman/openhuman")
-    subprocess.Popen(
-        ["node", "dist/main.js"],
-        cwd=oh_dir,
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-    )
-    print("  👁️  OpenHuman → starting")
+    # ── Head 3: OpenHuman ──
+    oh_dir = os.path.expanduser("~/openhuman")
+    if os.path.isdir(oh_dir):
+        try:
+            log_path = os.path.join(HYDRA_DIR, "logs", "openhuman.log")
+            with open(log_path, "a") as lf:
+                subprocess.Popen(
+                    ["node", "dist/main.js"],
+                    cwd=oh_dir, stdout=lf, stderr=lf
+                )
+            print("  👁️  OpenHuman   → starting (node dist/main.js)")
+        except Exception as e:
+            print(f"  👁️  OpenHuman   → warning: {e}")
+    else:
+        print(f"  👁️  OpenHuman   → not found at {oh_dir}")
 
-    # Start bridge
-    bridge_script = os.path.expanduser("~/hydra_bridge.py")
-    subprocess.Popen(
-        ["python3", bridge_script],
-        stdout=open(os.path.expanduser("~/HydraPrime/logs/bridge.log"), "a"),
-        stderr=subprocess.STDOUT
-    )
-    print("  🌉 Bridge → starting on :9999")
-    print("\n✅ HydraPrime online. Use 'hydra status' to confirm all heads.")
+    # ── Bridge ──
+    bridge = os.path.expanduser("~/hydra_bridge.py")
+    log_path = os.path.join(HYDRA_DIR, "logs", "bridge.log")
+    try:
+        with open(log_path, "a") as lf:
+            subprocess.Popen(["python3", bridge], stdout=lf, stderr=lf)
+        print("  🌉 Bridge       → starting (port 9999)\n")
+    except Exception as e:
+        print(f"  🌉 Bridge       → warning: {e}\n")
+
+    print("Waiting for heads to come up...")
+    time.sleep(5)
+    cmd_status()
+
+def cmd_stop():
+    subprocess.run(["sv", "down", "openclaw"], capture_output=True)
+    subprocess.run(["pkill", "-f", "hermes gateway"], capture_output=True)
+    subprocess.run(["pkill", "-f", "hydra_bridge"], capture_output=True)
+    subprocess.run(["pkill", "-f", "openhuman"], capture_output=True)
+    print("🐉 HydraPrime stopped.")
 
 def cmd_status():
-    """Check status of all heads."""
     try:
         r = requests.get(f"{BRIDGE}/status", timeout=5)
-        data = r.json()
-        print(f"🐉 HydraPrime: {data['hydra'].upper()}")
-        print(f"   Heads online: {data['heads_online']}")
-        for h in data["heads"]:
+        d = r.json()
+        print(f"🐉 HydraPrime: {d.get('hydra','?').upper()}")
+        print(f"   Heads online: {d.get('heads_online','?')}")
+        for h in d.get("heads", []):
             icon = "✅" if h["status"] == "online" else "❌"
-            print(f"   {icon} {h['head']}: {h['status']}")
+            extra = f"  (code {h['code']})" if h.get("code") else f"  ({h.get('error','')})"
+            print(f"   {icon} {h['head']}: {h['status']}{extra}")
     except Exception:
-        print("❌ Bridge is offline. Run 'hydra start' first.")
+        print("❌ Bridge offline — run 'hydra start'")
 
 def cmd_think(task: str):
-    """Send a task to the Hermes brain."""
-    print(f"🧠 Thinking: {task}")
+    if not task:
+        print("Usage: hydra think \"your task\"")
+        return
+    print(f"🧠 Hermes → {task}\n")
     try:
-        r = requests.post(f"{BRIDGE}/think", json={"task": task}, timeout=60)
-        data = r.json()
-        result = data.get("result", data.get("output", json.dumps(data, indent=2)))
-        print(f"\n📤 Result:\n{result}")
+        r = requests.post(f"{BRIDGE}/think", json={"task": task}, timeout=90)
+        d = r.json()
+        out = d.get("result", d.get("output", d.get("response", json.dumps(d, indent=2))))
+        print(f"📤 Result:\n{out}")
     except Exception as e:
-        print(f"❌ Error: {e}")
+        print(f"❌ {e}")
 
 def cmd_execute(task: str):
-    """Full fusion execution — all three heads."""
-    print(f"🐉 Full fusion executing: {task}")
+    if not task:
+        print("Usage: hydra execute \"your task\"")
+        return
+    print(f"🐉 Full fusion → {task}\n")
     try:
-        r = requests.post(f"{BRIDGE}/execute", json={"task": task}, timeout=90)
-        data = r.json()
-        result = data.get("result", {})
-        output = result.get("result", result.get("output", str(result)))
-        print(f"\n📤 Result:\n{output}")
-        print(f"\n📍 Hardware: {json.dumps(data.get('hardware_snapshot', {}), indent=2)[:300]}")
+        r = requests.post(f"{BRIDGE}/execute", json={"task": task}, timeout=120)
+        d = r.json()
+        result = d.get("result", {})
+        out = result.get("result", result.get("output", result.get("response", str(result))))
+        hw  = d.get("hardware", {})
+        print(f"📤 Result:\n{out}\n")
+        gps = hw.get("gps", {}).get("data", {})
+        bat = hw.get("battery", {}).get("data", {})
+        if gps or bat:
+            print(f"📍 Hardware snapshot: GPS={gps} | Battery={bat}")
     except Exception as e:
-        print(f"❌ Error: {e}")
+        print(f"❌ {e}")
 
 def cmd_sense(sensor: str):
-    """Query hardware via OpenClaw."""
     print(f"🦾 Sensing: {sensor}")
     try:
         r = requests.get(f"{BRIDGE}/sense/{sensor}", timeout=10)
         print(json.dumps(r.json(), indent=2))
     except Exception as e:
-        print(f"❌ Error: {e}")
+        print(f"❌ {e}")
 
-def cmd_context(scope: str = "today"):
-    """Pull life context from OpenHuman."""
-    print(f"👁️  Pulling context: {scope}")
+def cmd_context(scope: str):
+    print(f"👁️  Context: {scope}")
     try:
         r = requests.get(f"{BRIDGE}/context/{scope}", timeout=10)
         print(json.dumps(r.json(), indent=2))
     except Exception as e:
-        print(f"❌ Error: {e}")
+        print(f"❌ {e}")
 
-def cmd_stop():
-    """Stop all heads."""
-    subprocess.run(["sv", "down", "openclaw"], capture_output=True)
-    subprocess.run(["pkill", "-f", "hermes"], capture_output=True)
-    subprocess.run(["pkill", "-f", "hydra_bridge"], capture_output=True)
-    subprocess.run(["pkill", "-f", "openhuman"], capture_output=True)
-    print("🐉 HydraPrime stopped.")
+def cmd_logs(head: str = "bridge"):
+    log_map = {
+        "bridge":    f"{HYDRA_DIR}/logs/bridge.log",
+        "openclaw":  "/data/data/com.termux/files/usr/var/log/openclaw/current",
+        "hermes":    "/tmp/hermes_gateway.log",
+        "openhuman": f"{HYDRA_DIR}/logs/openhuman.log",
+    }
+    path = log_map.get(head, log_map["bridge"])
+    try:
+        os.system(f"tail -50 {path}")
+    except Exception as e:
+        print(f"❌ {e}")
 
 def cmd_help():
-    banner()
     print("""
-Commands:
-  hydra start                   Start all three heads + bridge
-  hydra stop                    Stop all heads
-  hydra status                  Check all heads online/offline
-  hydra think "<task>"          Send task to Hermes brain
-  hydra execute "<task>"        Full fusion: hardware + context + brain
-  hydra sense <sensor>          Query hardware (gps, battery, network, camera)
-  hydra context <scope>         Pull life context (today, calendar, email, memory)
-  hydra help                    Show this help
+🐉 HydraPrime CLI
 
-Sensors:  gps | battery | camera | network | sensors | microphone
-Scopes:   today | calendar | email | memory | all
+  hydra start                   Start all three heads + bridge
+  hydra stop                    Stop everything
+  hydra status                  Check all heads online/offline
+
+  hydra think  "task"           Hermes brain only
+  hydra execute "task"          Full fusion (hardware + context + brain)
+
+  hydra sense  <sensor>         OpenClaw hardware query
+      Sensors: gps | battery | network | camera | sensors | microphone
+
+  hydra context <scope>         OpenHuman life context
+      Scopes:  today | calendar | email | memory | slack | github | all
+
+  hydra logs   <head>           Tail logs
+      Heads:   bridge | openclaw | hermes | openhuman
+
+  hydra help                    This screen
 """)
 
-# ── Main ────────────────────────────────────────────────────
+# ── Entry ──────────────────────────────────────────────────
 if __name__ == "__main__":
     args = sys.argv[1:]
     if not args:
-        cmd_help()
-        sys.exit(0)
+        cmd_help(); sys.exit(0)
 
-    cmd = args[0].lower()
+    cmd  = args[0].lower()
+    rest = " ".join(args[1:]) if len(args) > 1 else ""
+    arg1 = args[1] if len(args) > 1 else ""
 
-    if cmd == "start":        cmd_start()
-    elif cmd == "stop":       cmd_stop()
-    elif cmd == "status":     cmd_status()
-    elif cmd == "think":      cmd_think(" ".join(args[1:]) if len(args) > 1 else "")
-    elif cmd == "execute":    cmd_execute(" ".join(args[1:]) if len(args) > 1 else "")
-    elif cmd == "sense":      cmd_sense(args[1] if len(args) > 1 else "battery")
-    elif cmd == "context":    cmd_context(args[1] if len(args) > 1 else "today")
-    elif cmd == "help":       cmd_help()
+    if   cmd == "start":    cmd_start()
+    elif cmd == "stop":     cmd_stop()
+    elif cmd == "status":   cmd_status()
+    elif cmd == "think":    cmd_think(rest)
+    elif cmd == "execute":  cmd_execute(rest)
+    elif cmd == "sense":    cmd_sense(arg1 or "battery")
+    elif cmd == "context":  cmd_context(arg1 or "today")
+    elif cmd == "logs":     cmd_logs(arg1 or "bridge")
+    elif cmd == "help":     cmd_help()
     else:
         print(f"Unknown command: {cmd}")
         cmd_help()
