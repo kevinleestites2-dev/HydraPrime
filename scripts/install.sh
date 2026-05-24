@@ -2,166 +2,263 @@
 # ============================================================
 # HydraPrime — Unified Installer
 # Three heads. One body. Total autonomy.
+# OpenClaw (hardware) + Hermes (brain) + OpenHuman (context)
 # ============================================================
 
 set -e
 
-HYDRA_DIR="$HOME/HydraPrime"
-HEADS_DIR="$HYDRA_DIR/heads"
-CONFIG_DIR="$HYDRA_DIR/config"
-LOG_DIR="$HYDRA_DIR/logs"
-
 RED='\033[0;31m'
-GREEN='\033[0;32m'
+GREEN='\033[1;32m'
 CYAN='\033[0;36m'
 YELLOW='\033[1;33m'
 BOLD='\033[1m'
 NC='\033[0m'
 
+HYDRA_DIR="$HOME/HydraPrime"
+CONFIG_DIR="$HYDRA_DIR/config"
+LOG_DIR="$HYDRA_DIR/logs"
+
 echo -e "${CYAN}${BOLD}"
-echo "  🐉 HydraPrime Installer"
-echo "  Three heads. One body. Total autonomy."
+echo "  ╔══════════════════════════════════════╗"
+echo "  ║   🐉 HydraPrime — Unified Installer  ║"
+echo "  ║   Three heads. One body.             ║"
+echo "  ╚══════════════════════════════════════╝"
 echo -e "${NC}"
 
-# ── Step 0: Base dependencies ──────────────────────────────
-echo -e "${YELLOW}[0/6] Installing base dependencies...${NC}"
-pkg update -y -q
-pkg install -y -q python python-pip git curl nodejs proot-distro rsvg2
+mkdir -p "$CONFIG_DIR" "$LOG_DIR"
 
-# ── Step 1: Setup dirs ─────────────────────────────────────
-echo -e "${YELLOW}[1/6] Setting up HydraPrime directories...${NC}"
-mkdir -p "$HEADS_DIR" "$CONFIG_DIR" "$LOG_DIR"
-mkdir -p "$HEADS_DIR/openclaw"
-mkdir -p "$HEADS_DIR/hermes"
-mkdir -p "$HEADS_DIR/openhuman"
+# ─────────────────────────────────────────────────────────
+# STEP 0 — Base dependencies
+# ─────────────────────────────────────────────────────────
+echo -e "${YELLOW}[0/5] Installing base dependencies...${NC}"
+export DEBIAN_FRONTEND=noninteractive
+pkg update -y -o Dpkg::Options::="--force-confnew" 2>/dev/null || pkg update -y
+pkg upgrade -y 2>/dev/null || true
+pkg install -y git python nodejs-lts build-essential cmake clang ninja \
+    pkg-config binutils termux-api termux-services proot-distro tmux nano \
+    rust make libffi openssl ripgrep ffmpeg
 
-# ── Step 2: HEAD 1 — OpenClaw ─────────────────────────────
-echo -e "${YELLOW}[2/6] Installing Head 1: OpenClaw (Hardware)...${NC}"
-cd "$HEADS_DIR/openclaw"
+# Fix TMPDIR (critical for Node/npm on Termux)
+mkdir -p "$PREFIX/tmp" "$HOME/tmp"
+touch ~/.bashrc
+sed -i '/export TMPDIR=/d' ~/.bashrc
+sed -i '/export TMP=/d' ~/.bashrc
+sed -i '/export TEMP=/d' ~/.bashrc
+echo 'export TMPDIR="$PREFIX/tmp"' >> ~/.bashrc
+echo 'export TMP="$PREFIX/tmp"' >> ~/.bashrc
+echo 'export TEMP="$PREFIX/tmp"' >> ~/.bashrc
+export TMPDIR="$PREFIX/tmp"
+export TMP="$PREFIX/tmp"
+export TEMP="$PREFIX/tmp"
 
-# Install termux tools for hardware access
-pkg install -y -q termux-api
+# Fix Node-GYP crash
+mkdir -p ~/.gyp
+echo "{'variables':{'android_ndk_path':''}}" > ~/.gyp/include.gypi
 
-# Clone OpenClaw setup
-if [ ! -d "openclaw-android-setup" ]; then
-  git clone --depth=1 https://github.com/kevinleestites2-dev/OpenClaw-Android.git openclaw-android-setup
+echo -e "${GREEN}  ✅ Base dependencies ready${NC}"
+
+# ─────────────────────────────────────────────────────────
+# STEP 1 — HEAD 1: OpenClaw (Hardware Layer)
+# ─────────────────────────────────────────────────────────
+echo -e "${YELLOW}[1/5] Installing Head 1: OpenClaw (Hardware)...${NC}"
+
+# Install OpenClaw via npm
+npm install -g openclaw@latest 2>&1 | tee "$LOG_DIR/openclaw_install.log" | tail -5
+
+# Patch hardcoded /tmp paths (critical on Android)
+TARGET_FILE="$PREFIX/lib/node_modules/openclaw/dist/entry.js"
+if [ -f "$TARGET_FILE" ]; then
+    sed -i "s|/tmp/openclaw|$PREFIX/tmp/openclaw|g" "$TARGET_FILE"
+    echo -e "${GREEN}  ✅ Patched entry.js${NC}"
 fi
 
-cd openclaw-android-setup
-chmod +x *.sh 2>/dev/null || true
+# Setup background service
+SERVICE_DIR="$PREFIX/var/service/openclaw"
+OPENCLAW_LOG_DIR="$PREFIX/var/log/openclaw"
+mkdir -p "$SERVICE_DIR/log" "$OPENCLAW_LOG_DIR"
 
-# Run OpenClaw setup non-interactively
-if command -v openclaw &>/dev/null; then
-  echo -e "${GREEN}  ✅ OpenClaw already installed${NC}"
-else
-  bash setup_claw.sh 2>&1 | tee "$LOG_DIR/openclaw_install.log" || true
-  source ~/.bashrc 2>/dev/null || true
-fi
+cat > "$SERVICE_DIR/run" << SVCEOF
+#!/data/data/com.termux/files/usr/bin/sh
+export PATH=$PREFIX/bin:\$PATH
+export TMPDIR=$PREFIX/tmp
+exec openclaw gateway 2>&1
+SVCEOF
 
-# Start OpenClaw service
-sv up openclaw 2>/dev/null || true
-termux-wake-lock 2>/dev/null || true
+cat > "$SERVICE_DIR/log/run" << LOGEOF
+#!/data/data/com.termux/files/usr/bin/sh
+exec svlogd -tt $OPENCLAW_LOG_DIR
+LOGEOF
+
+chmod +x "$SERVICE_DIR/run" "$SERVICE_DIR/log/run"
+
+# Set SVDIR for service manager
+sed -i '/export SVDIR=/d' ~/.bashrc
+echo 'export SVDIR="$PREFIX/var/service"' >> ~/.bashrc
+export SVDIR="$PREFIX/var/service"
+
+service-daemon stop >/dev/null 2>&1 || true
+service-daemon start >/dev/null 2>&1 || true
+sleep 2
+sv-enable openclaw 2>/dev/null || true
+
 echo -e "${GREEN}  ✅ OpenClaw ready — Web UI: http://localhost:18789${NC}"
+echo -e "${YELLOW}  ⚠️  Run 'openclaw onboard' first (say NO to daemon install — already done)${NC}"
 
-# ── Step 3: HEAD 2 — Hermes ───────────────────────────────
-echo -e "${YELLOW}[3/6] Installing Head 2: Hermes (Brain)...${NC}"
-cd "$HEADS_DIR/hermes"
+# ─────────────────────────────────────────────────────────
+# STEP 2 — HEAD 2: Hermes (Brain / Intelligence Layer)
+# ─────────────────────────────────────────────────────────
+echo -e "${YELLOW}[2/5] Installing Head 2: Hermes (Brain)...${NC}"
 
-# proot Ubuntu for Hermes
-if ! proot-distro list | grep -q "ubuntu.*installed"; then
-  proot-distro install ubuntu
+# Fix Python sysconfig for psutil on Python 3.13
+_pyfile="$(find $PREFIX/lib/python3.* -name '_sysconfigdata*.py' 2>/dev/null | head -1)"
+if [ -f "$_pyfile" ]; then
+    cp "$_pyfile" "$_pyfile.backup" 2>/dev/null || true
+    sed -i 's|-fno-openmp-implicit-rpath||g' "$_pyfile"
+    rm -rf "$PREFIX/lib/python3."*/__pycache__ 2>/dev/null || true
 fi
 
-# Clone Hermes inside proot
+# Install Ubuntu via proot-distro (Hermes needs it)
+if ! proot-distro list 2>/dev/null | grep -q "ubuntu"; then
+    proot-distro install ubuntu
+fi
+
+# Install Hermes inside proot Ubuntu
 proot-distro login ubuntu -- bash -c "
-  apt-get update -qq
-  apt-get install -y -qq python3 python3-pip git curl
-  if [ ! -d /root/hermes ]; then
-    git clone --depth=1 https://github.com/kevinleestites2-dev/Hermes-Agent-On-Android.git /root/hermes
-  fi
-  cd /root/hermes
-  pip3 install -q -r requirements.txt 2>/dev/null || pip3 install -q hermes-agent 2>/dev/null || true
-  echo 'Hermes dependencies ready'
-" 2>&1 | tee "$LOG_DIR/hermes_install.log" | tail -5
+    export DEBIAN_FRONTEND=noninteractive
+    apt update -qq && apt upgrade -y -qq -o Dpkg::Options::='--force-confold'
+    apt install -y -qq python3 python3-pip python3-venv git curl build-essential nodejs npm
 
-echo -e "${GREEN}  ✅ Hermes ready — Gateway: http://localhost:8765${NC}"
+    if [ ! -d /root/hermes-agent ]; then
+        git clone --recurse-submodules https://github.com/NousResearch/hermes-agent.git /root/hermes-agent
+    fi
 
-# ── Step 4: HEAD 3 — OpenHuman ────────────────────────────
-echo -e "${YELLOW}[4/6] Installing Head 3: OpenHuman (Context)...${NC}"
-cd "$HEADS_DIR/openhuman"
+    cd /root/hermes-agent
+    python3 -m venv venv
+    source venv/bin/activate
+    pip install --upgrade pip setuptools wheel -q
+    pip install -e . -q
+    ln -sf /root/hermes-agent/venv/bin/hermes /usr/local/bin/hermes 2>/dev/null || true
+    echo 'Hermes installed OK'
+" 2>&1 | tee "$LOG_DIR/hermes_install.log" | tail -8
 
-if [ ! -d "openhuman" ]; then
-  git clone --depth=1 https://github.com/kevinleestites2-dev/openhuman.git openhuman
+echo -e "${GREEN}  ✅ Hermes ready${NC}"
+echo -e "${YELLOW}  ⚠️  Run 'hermes setup' inside proot to configure model/API keys${NC}"
+
+# ─────────────────────────────────────────────────────────
+# STEP 3 — HEAD 3: OpenHuman (Context Layer)
+# ─────────────────────────────────────────────────────────
+echo -e "${YELLOW}[3/5] Installing Head 3: OpenHuman (Context)...${NC}"
+
+OH_DIR="$HOME/openhuman"
+if [ ! -d "$OH_DIR" ]; then
+    git clone --depth=1 https://github.com/kevinleestites2-dev/openhuman.git "$OH_DIR"
 fi
 
-cd openhuman
+cd "$OH_DIR"
 
-# Install Node deps for OpenHuman core
-if command -v npm &>/dev/null; then
-  npm install --silent 2>&1 | tail -3 || true
+# Install Node dependencies
+if [ -f "package.json" ]; then
+    npm install --silent 2>&1 | tail -5 || true
+fi
+
+# Build if needed
+if [ -f "package.json" ] && grep -q '"build"' package.json; then
+    npm run build --silent 2>&1 | tail -5 || true
 fi
 
 echo -e "${GREEN}  ✅ OpenHuman ready — Core: http://localhost:3000${NC}"
 
-# ── Step 5: Hydra Bridge ──────────────────────────────────
-echo -e "${YELLOW}[5/6] Installing HydraPrime Bridge...${NC}"
-pip3 install -q flask requests python-dotenv aiohttp
+# ─────────────────────────────────────────────────────────
+# STEP 4 — HydraPrime Bridge
+# ─────────────────────────────────────────────────────────
+echo -e "${YELLOW}[4/5] Installing HydraPrime Bridge...${NC}"
 
-# Copy bridge to home
-cp "$HYDRA_DIR/core/hydra_bridge.py" "$HOME/hydra_bridge.py" 2>/dev/null || true
-cp "$HYDRA_DIR/core/hydra_cli.py" "$HOME/hydra" 2>/dev/null || true
+pip install -q flask requests python-dotenv aiohttp 2>/dev/null || \
+    pip3 install -q flask requests python-dotenv aiohttp
+
+# Download bridge and CLI from HydraPrime repo
+curl -fsSL "https://raw.githubusercontent.com/kevinleestites2-dev/HydraPrime/main/core/hydra_bridge.py" \
+    -o "$HOME/hydra_bridge.py" 2>/dev/null || \
+    echo -e "${YELLOW}  ⚠️  Clone repo manually if raw fetch fails${NC}"
+
+curl -fsSL "https://raw.githubusercontent.com/kevinleestites2-dev/HydraPrime/main/core/hydra_cli.py" \
+    -o "$HOME/hydra" 2>/dev/null || true
+
 chmod +x "$HOME/hydra" 2>/dev/null || true
 
-# Add hydra to PATH
-if ! grep -q "HydraPrime" ~/.bashrc; then
-  echo '' >> ~/.bashrc
-  echo '# HydraPrime' >> ~/.bashrc
-  echo 'export PATH="$HOME:$PATH"' >> ~/.bashrc
-  echo 'export HYDRA_DIR="$HOME/HydraPrime"' >> ~/.bashrc
+# Add to PATH
+if ! grep -q "# HydraPrime" ~/.bashrc; then
+    echo '' >> ~/.bashrc
+    echo '# HydraPrime' >> ~/.bashrc
+    echo 'export PATH="$HOME:$PATH"' >> ~/.bashrc
+    echo 'export HYDRA_DIR="$HOME/HydraPrime"' >> ~/.bashrc
 fi
 
-echo -e "${GREEN}  ✅ Bridge ready${NC}"
+echo -e "${GREEN}  ✅ Bridge ready — port 9999${NC}"
 
-# ── Step 6: Config ────────────────────────────────────────
-echo -e "${YELLOW}[6/6] Writing default config...${NC}"
-cat > "$CONFIG_DIR/hydra.env" << 'EOF'
+# ─────────────────────────────────────────────────────────
+# STEP 5 — Config
+# ─────────────────────────────────────────────────────────
+echo -e "${YELLOW}[5/5] Writing config...${NC}"
+
+cat > "$CONFIG_DIR/hydra.env" << 'CFGEOF'
+# ═══════════════════════════════════════
 # HydraPrime Configuration
-# Fill in your API keys and model preferences
+# ═══════════════════════════════════════
 
-# ── Model (Hermes Brain) ──────────────────────────────────
-HERMES_MODEL=ollama/gemma4:31b-cloud   # or openai/gpt-4o, anthropic/claude-3-5-sonnet
+# ── Hermes (Brain) ──────────────────────
+# Model options:
+#   ollama/gemma4:31b-cloud  (local, no API cost)
+#   openai/gpt-4o
+#   anthropic/claude-3-5-sonnet
+HERMES_MODEL=ollama/gemma3:4b
 HERMES_GATEWAY_PORT=8765
 
-# ── OpenClaw ──────────────────────────────────────────────
+# ── OpenClaw (Hardware) ─────────────────
 OPENCLAW_PORT=18789
 
-# ── OpenHuman ─────────────────────────────────────────────
+# ── OpenHuman (Context) ─────────────────
 OPENHUMAN_PORT=3000
 
-# ── Reporting ─────────────────────────────────────────────
+# ── Hydra Bridge ────────────────────────
+HYDRA_BRIDGE_PORT=9999
+
+# ── Telegram Reporting ──────────────────
 TELEGRAM_BOT_TOKEN=8616341142:AAGv9M_buIvZtzzDGUE5ikE4K9GTlZ9E5ik
 TELEGRAM_CHAT_ID=7135054241
 
-# ── API Keys (optional — Hermes uses these) ───────────────
+# ── API Keys (Hermes uses these) ────────
 OPENAI_API_KEY=
 ANTHROPIC_API_KEY=
 GEMINI_API_KEY=
-EOF
+CFGEOF
 
-echo -e "${GREEN}  ✅ Config written: $CONFIG_DIR/hydra.env${NC}"
+echo -e "${GREEN}  ✅ Config: $CONFIG_DIR/hydra.env${NC}"
 
-# ── Done ──────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────
+# DONE
+# ─────────────────────────────────────────────────────────
+source ~/.bashrc 2>/dev/null || true
+
 echo ""
 echo -e "${CYAN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo -e "${GREEN}${BOLD}  🐉 HydraPrime Installation Complete${NC}"
 echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo ""
-echo -e "  Start all heads:    ${BOLD}hydra start${NC}"
-echo -e "  Check status:       ${BOLD}hydra status${NC}"
-echo -e "  Send a command:     ${BOLD}hydra think \"your task\"${NC}"
-echo -e "  Hardware query:     ${BOLD}hydra sense gps${NC}"
-echo -e "  Life context:       ${BOLD}hydra context today${NC}"
+echo -e "  ${YELLOW}REQUIRED first-time steps:${NC}"
+echo -e "  1. ${BOLD}openclaw onboard${NC}              (say NO to daemon)"
+echo -e "  2. ${BOLD}proot-distro login ubuntu${NC}"
+echo -e "     ${BOLD}cd hermes-agent && source venv/bin/activate${NC}"
+echo -e "     ${BOLD}hermes setup${NC}                  (configure your model)"
+echo -e "     ${BOLD}exit${NC}"
 echo ""
-echo -e "  Edit config:        ${BOLD}nano $CONFIG_DIR/hydra.env${NC}"
+echo -e "  ${YELLOW}Then start everything:${NC}"
+echo -e "  ${BOLD}hydra start${NC}"
 echo ""
-source ~/.bashrc 2>/dev/null || true
+echo -e "  ${YELLOW}Commands:${NC}"
+echo -e "  ${BOLD}hydra status${NC}                     check all heads"
+echo -e "  ${BOLD}hydra execute \"task\"${NC}             full 3-head fusion"
+echo -e "  ${BOLD}hydra think \"task\"${NC}               brain only"
+echo -e "  ${BOLD}hydra sense gps${NC}                  hardware query"
+echo -e "  ${BOLD}hydra context today${NC}              life context"
+echo ""
